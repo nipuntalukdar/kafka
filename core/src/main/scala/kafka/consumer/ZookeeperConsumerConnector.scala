@@ -19,6 +19,11 @@ package kafka.consumer
 
 import java.util.concurrent._
 import java.util.concurrent.atomic._
+import java.util.concurrent.BlockingQueue
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.ArrayList
 import locks.ReentrantLock
 import collection._
 import kafka.cluster._
@@ -35,6 +40,8 @@ import kafka.common._
 import com.yammer.metrics.core.Gauge
 import kafka.metrics._
 import scala.Some
+import scala.collection.mutable.LinkedHashSet
+import scala.collection.mutable.HashMap
 
 
 /**
@@ -89,7 +96,8 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
   private val topicThreadIdAndQueues = new Pool[(String,String), BlockingQueue[FetchedDataChunk]]
   private val scheduler = new KafkaScheduler(threads = 1, threadNamePrefix = "kafka-consumer-scheduler-")
   private val messageStreamCreated = new AtomicBoolean(false)
-
+  private val rebalanceChekers = new LinkedHashSet[RebalanceEventChecker]
+  
   private var sessionExpirationListener: ZKSessionExpireListener = null
   private var topicPartitionChangeListener: ZKTopicPartitionChangeListener = null
   private var loadBalancerListener: ZKRebalancerListener = null
@@ -156,6 +164,17 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
     zkClient = new ZkClient(config.zkConnect, config.zkSessionTimeoutMs, config.zkConnectionTimeoutMs, ZKStringSerializer)
   }
 
+  // NIPUN
+  def getZKClient() {
+    zkClient
+  }
+  
+  def addRebalanceEventChecker(checker: RebalanceEventChecker) {
+    rebalanceLock synchronized {
+	  rebalanceChekers.add(checker)
+    }
+  }
+
   def shutdown() {
     rebalanceLock synchronized {
       val canShutdown = isShuttingDown.compareAndSet(false, true);
@@ -174,6 +193,8 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
           sendShutdownToAllQueues()
           if (config.autoCommitEnable)
             commitOffsets()
+          // NIPUN ADDED
+          loadBalancerListener.releasePartitions()
           if (zkClient != null) {
             zkClient.close()
             zkClient = null
@@ -216,6 +237,19 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
 
   // this API is used by unit tests only
   def getTopicRegistry: Pool[String, Pool[Int, PartitionTopicInfo]] = topicRegistry
+  
+  // NIPUN ADDED THIS
+  def getConsumedTopicPartitions(): HashMap[String, ArrayList[Int]] = {
+    var ret = new HashMap[String, ArrayList[Int]]
+    for ((topic, infos) <- topicRegistry) {
+      var partitionList = new ArrayList[Int]
+      for (partition <- infos.keys) {
+        partitionList.add(partition)
+      }
+      ret.put(topic, partitionList)
+    }
+    ret
+  }
 
   private def registerConsumerInZK(dirs: ZKGroupDirs, consumerIdString: String, topicCount: TopicCount) {
     info("begin registering consumer " + consumerIdString + " in ZK")
@@ -225,6 +259,7 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
 
     createEphemeralPathExpectConflictHandleZKBug(zkClient, dirs.consumerRegistryDir + "/" + consumerIdString, consumerRegistrationInfo, null,
                                                  (consumerZKString, consumer) => true, config.zkSessionTimeoutMs)
+    info("CONSUMER REGISTRATION INFO " + consumerRegistrationInfo)
     info("end registering consumer " + consumerIdString + " in ZK")
   }
 
@@ -249,6 +284,32 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
     }
   }
 
+  def commitOffsets(topicPassed: String, partition: Int, newOffset: Long) {
+    if (zkClient == null) {
+      error("zk client is null. Cannot commit offsets")
+      return
+    }
+    for ((topic, infos) <- topicRegistry) {
+      val topicDirs = new ZKGroupTopicDirs(config.groupId, topic)
+      for (topicInfo <- infos.values) {
+        if (topicInfo.partitionId == partition && topicInfo.topic.equals(topicPassed)) {
+          if (newOffset != checkpointedOffsets.get(TopicAndPartition(topic, topicInfo.partitionId))) {
+            try {
+              updatePersistentPath(zkClient, topicDirs.consumerOffsetDir + "/" + topicInfo.partitionId, newOffset.toString)
+              checkpointedOffsets.put(TopicAndPartition(topic, topicInfo.partitionId), newOffset)
+            } catch {
+              case t: Throwable =>
+                // log it and let it go
+                warn("exception during commitOffsets", t)
+            }
+            debug("Committed offset " + newOffset + " for topic " + topic)
+          }
+          return
+        }
+      }
+    }
+  }
+
   def commitOffsets() {
     if (zkClient == null) {
       error("zk client is null. Cannot commit offsets")
@@ -265,7 +326,7 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
           } catch {
             case t: Throwable =>
               // log it and let it go
-              warn("exception during commitOffsets",  t)
+              warn("exception during commitOffsets", t)
           }
           debug("Committed offset " + newOffset + " for topic " + info)
         }
@@ -378,16 +439,31 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
       val topicDirs = new ZKGroupTopicDirs(group, topic)
       val znode = topicDirs.consumerOwnerDir + "/" + partition
       deletePath(zkClient, znode)
-      debug("Consumer " + consumerIdString + " releasing " + znode)
+      info("Consumer " + consumerIdString + " releasing " + znode)
     }
 
-    private def releasePartitionOwnership(localTopicRegistry: Pool[String, Pool[Int, PartitionTopicInfo]])= {
+    private def releasePartitionOwnership(localTopicRegistry: Pool[String, Pool[Int, PartitionTopicInfo]],
+        threadIds : Map[String, Set[String]]) = {
       info("Releasing partition ownership")
       for ((topic, infos) <- localTopicRegistry) {
         for(partition <- infos.keys)
           deletePartitionOwnershipFromZK(topic, partition)
         localTopicRegistry.remove(topic)
       }
+      
+      // NIPUN added
+      // Also delete any extra nodes owned by this consumer
+      if (threadIds != null) {
+        for ((topic, consumerThreadIdSet) <- threadIds) {
+          var topicDirs = new ZKGroupTopicDirs(group, topic)
+          deletePathsIfDataMatches(zkClient, topicDirs.consumerOwnerDir, consumerThreadIdSet)
+        }
+      }
+    }
+    
+    def releasePartitions() {
+      info("Deleting partition ownership")
+      releasePartitionOwnership(topicRegistry, null)
     }
 
     def resetState() {
@@ -400,6 +476,9 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
           return
         } else {
           for (i <- 0 until config.rebalanceMaxRetries) {
+        	// NIPUN added, rebalance start at time boundary when the (timestamp % 3000) == 0
+            var curTime = System.currentTimeMillis
+            Thread.sleep(5000 - (curTime % 3000))
             info("begin rebalancing consumer " + consumerIdString + " try #" + i)
             var done = false
             var cluster: Cluster = null
@@ -456,7 +535,7 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
          */
         closeFetchers(cluster, kafkaMessageAndMetadataStreams, myTopicThreadIdsMap)
 
-        releasePartitionOwnership(topicRegistry)
+        releasePartitionOwnership(topicRegistry, myTopicThreadIdsMap)
 
         var partitionOwnershipDecision = new collection.mutable.HashMap[(String, Int), String]()
         val currentTopicRegistry = new Pool[String, Pool[Int, PartitionTopicInfo]]
@@ -507,6 +586,10 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
           debug("Partitions per topic cache " + partitionsPerTopicMap)
           debug("Consumers per topic cache " + consumersPerTopicMap)
           topicRegistry = currentTopicRegistry
+          var rebcheckerIt = rebalanceChekers.iterator
+          while (rebcheckerIt.hasNext){
+            rebcheckerIt.next.rebalanceReady
+          }
           updateFetcher(cluster)
           true
         } else {

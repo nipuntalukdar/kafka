@@ -20,6 +20,9 @@ import kafka.serializer._
 import kafka.consumer._
 import scala.collection.mutable
 import scala.collection.JavaConversions
+import java.util.HashMap
+import java.util.ArrayList
+import java.lang.Integer
 
 
 /**
@@ -101,12 +104,42 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
     
   def createMessageStreamsByFilter(topicFilter: TopicFilter) = 
     createMessageStreamsByFilter(topicFilter, 1, new DefaultDecoder(), new DefaultDecoder())
-    
+  
+  // ADDED BY NIPUN
+  def commitOffsets(topic: String, partition : Int, offset: Long){
+    underlying.commitOffsets(topic, partition, offset)
+  }
+  
   def commitOffsets() {
     underlying.commitOffsets
+  }
+  
+  // ADDED BY NIPUN
+  def addRebalanceEventChecker(checker : RebalanceEventChecker) {
+    underlying.addRebalanceEventChecker(checker)
+  }
+  
+  // ADDED BY NIPUN
+  def getConsumedTopicPartitions(): HashMap[String, ArrayList[Integer]] = {
+    var tmp = underlying.getConsumedTopicPartitions
+    var ret = new HashMap[String, ArrayList[Integer]]
+    for ((topic, partitionList) <- tmp if !partitionList.isEmpty) {
+    	var it = partitionList.iterator
+    	var list = new ArrayList[Integer]
+    	while (it.hasNext){
+    	  list.add(it.next)
+    	}
+    	ret.put(topic, list)
+    }
+    ret
   }
 
   def shutdown() {
     underlying.shutdown
+  }
+  
+  //NIPUN
+  def getZKClient() {
+    underlying.getZKClient
   }
 }

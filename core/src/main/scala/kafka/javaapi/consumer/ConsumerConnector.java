@@ -20,8 +20,11 @@ package kafka.javaapi.consumer;
 
 import kafka.consumer.KafkaStream;
 import kafka.consumer.TopicFilter;
+import kafka.consumer.RebalanceEventChecker;
 import kafka.serializer.Decoder;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -62,7 +65,18 @@ public interface ConsumerConnector {
    *  Commit the offsets of all broker partitions connected by this connector.
    */
   public void commitOffsets();
-
+  
+  // NIPUN added the below three interfaces
+  /**
+   * commit offsets for a specific topic connected by this connector
+   * @param topic   name of the topic
+   * @param partition partition number
+   * @param offset   offset to be set
+   */
+  public void commitOffsets(String topic, int partition, long offset);
+  public void addRebalanceEventChecker(RebalanceEventChecker checker);
+  public HashMap<String, ArrayList<Integer>> getConsumedTopicPartitions();
+    
   /**
    *  Shut down the connector
    */

@@ -20,6 +20,8 @@ package kafka.consumer
 import scala.collection._
 import kafka.utils.Logging
 import kafka.serializer._
+import scala.collection.mutable.HashMap
+import java.util.ArrayList
 
 /**
  *  Main interface for consumer
@@ -70,7 +72,19 @@ trait ConsumerConnector {
   /**
    *  Commit the offsets of all broker partitions connected by this connector.
    */
+  
   def commitOffsets
+  
+  // NIPUN added
+  /**
+   * Commit offset for a topic, for a partition 
+   */
+  
+  def commitOffsets(topic: String, partition : Int, offset: Long)
+  
+  //NIPUN added
+  def addRebalanceEventChecker(checker: RebalanceEventChecker)
+  def getConsumedTopicPartitions(): HashMap[String, ArrayList[Int]]
   
   /**
    *  Shut down the connector

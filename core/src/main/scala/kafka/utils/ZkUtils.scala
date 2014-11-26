@@ -422,6 +422,30 @@ object ZkUtils extends Logging {
       case e2: Throwable => throw e2
     }
   }
+
+  // NIPUN ADDED
+  def deletePathsIfDataMatches(client: ZkClient, parent: String, datas: Set[String]) = {
+    info("Trying to force delete any left over partition-ownership")
+    var children : Seq[String] = Nil
+    try  {
+      children = getChildrenParentMayNotExist(client, parent)
+    } catch {
+      case e: Exception => info("Ignoring " + e.getMessage())
+    }
+    for (child <- children) {
+      var storedData: String = null
+      try {
+        storedData = readData(client, parent + "/" + child)._1
+        if (datas contains storedData) {
+          info("Force deleting " + parent + "/" + child)
+          deletePath(client, parent + "/" + child)
+        }
+      } catch {
+        case e: Exception => info("Ignoring " + e.getMessage())
+      }
+    }
+  }
+
   
   def deletePath(client: ZkClient, path: String): Boolean = {
     try {
